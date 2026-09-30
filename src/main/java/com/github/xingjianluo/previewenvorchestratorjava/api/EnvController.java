@@ -16,6 +16,11 @@ import java.util.List;
 
 /**
  * 预览环境编排 REST 入口。租户由 X-Tenant-Id 头标识。
+ *
+ * <p>变更类接口（创建/启动/停止/销毁）支持可选请求头 {@code X-Request-Id}：
+ * 调用方用自己的请求标识提交，可用同一标识回查回执；不传时服务端生成并随响应返回。
+ * 创建的 body.idempotencyKey 仍承担“同标识重试合并到同一环境”的幂等语义；
+ * 不传 idempotencyKey 的两次创建彼此独立。
  */
 @RestController
 @RequestMapping("/api/envs")
@@ -30,18 +35,23 @@ public class EnvController {
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public EnvDto create(@RequestHeader("X-Tenant-Id") String tenantId,
+                         @RequestHeader(value = "X-Request-Id", required = false) String requestId,
                          @RequestBody CreateEnvRequest req) {
-        return EnvDto.from(service.create(tenantId, req.idempotencyKey()));
+        return EnvDto.from(service.create(tenantId, req.idempotencyKey(), requestId));
     }
 
     @PostMapping("/{envId}/start")
-    public EnvDto start(@RequestHeader("X-Tenant-Id") String tenantId, @PathVariable String envId) {
-        return EnvDto.from(service.start(tenantId, envId));
+    public EnvDto start(@RequestHeader("X-Tenant-Id") String tenantId,
+                        @RequestHeader(value = "X-Request-Id", required = false) String requestId,
+                        @PathVariable String envId) {
+        return EnvDto.from(service.start(tenantId, envId, requestId));
     }
 
     @PostMapping("/{envId}/stop")
-    public EnvDto stop(@RequestHeader("X-Tenant-Id") String tenantId, @PathVariable String envId) {
-        return EnvDto.from(service.stop(tenantId, envId));
+    public EnvDto stop(@RequestHeader("X-Tenant-Id") String tenantId,
+                       @RequestHeader(value = "X-Request-Id", required = false) String requestId,
+                       @PathVariable String envId) {
+        return EnvDto.from(service.stop(tenantId, envId, requestId));
     }
 
     @PostMapping("/{envId}/keep-alive")
@@ -50,8 +60,17 @@ public class EnvController {
     }
 
     @DeleteMapping("/{envId}")
-    public EnvDto destroy(@RequestHeader("X-Tenant-Id") String tenantId, @PathVariable String envId) {
-        return EnvDto.from(service.destroy(tenantId, envId));
+    public EnvDto destroy(@RequestHeader("X-Tenant-Id") String tenantId,
+                          @RequestHeader(value = "X-Request-Id", required = false) String requestId,
+                          @PathVariable String envId) {
+        return EnvDto.from(service.destroy(tenantId, envId, requestId));
+    }
+
+    /** 请求回执回查：同一请求标识反复查询结论稳定。 */
+    @GetMapping("/requests/{requestId}")
+    public ReceiptDto getReceipt(@RequestHeader("X-Tenant-Id") String tenantId,
+                                 @PathVariable String requestId) {
+        return ReceiptDto.from(service.getReceipt(tenantId, requestId));
     }
 
     @GetMapping("/{envId}")

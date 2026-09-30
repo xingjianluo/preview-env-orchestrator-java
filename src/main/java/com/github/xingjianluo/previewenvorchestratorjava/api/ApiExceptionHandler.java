@@ -16,13 +16,16 @@ public class ApiExceptionHandler {
     @ExceptionHandler(OrchestratorException.class)
     public ResponseEntity<ErrorResponse> handle(OrchestratorException e) {
         HttpStatus status = switch (e.reason()) {
-            case ENV_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case ENV_NOT_FOUND, RECEIPT_NOT_FOUND -> HttpStatus.NOT_FOUND;
             case TENANT_FORBIDDEN -> HttpStatus.FORBIDDEN;
             case QUOTA_EXCEEDED -> HttpStatus.TOO_MANY_REQUESTS;
-            case ILLEGAL_STATE_TRANSITION -> HttpStatus.CONFLICT;
+            case ILLEGAL_STATE_TRANSITION,
+                 ENV_STILL_PROVISIONING,
+                 REQUEST_IN_PROGRESS,
+                 REQUEST_KIND_CONFLICT -> HttpStatus.CONFLICT;
             case BACKEND_FAILURE -> HttpStatus.BAD_GATEWAY;
         };
         return ResponseEntity.status(status)
-                .body(new ErrorResponse(e.reason().name(), e.getMessage()));
+                .body(new ErrorResponse(e.reason().name(), e.getMessage(), e.requestId()));
     }
 }
