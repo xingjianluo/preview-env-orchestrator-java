@@ -87,6 +87,25 @@ class ConcurrencyTest {
     }
 
     @Test
+    void concurrentSameRequestIdRetriesMergeIntoSingleEnv() throws Exception {
+        // 新调用方式：所有并发线程带同一个 X-Request-Id（且无 idempotencyKey），
+        // 去重键即请求标识，必须合并为一个环境、开通一次、占一份配额。
+        int threads = 16;
+        List<Callable<EnvRecord>> tasks = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            tasks.add(() -> service.createWithRequestId("tenant-a", null, "shared-request-id").record());
+        }
+        List<EnvRecord> results = runConcurrently(tasks);
+        Set<String> envIds = new HashSet<>();
+        results.forEach(r -> envIds.add(r.envId()));
+        assertEquals(1, envIds.size(), "同一请求标识的并发重试只能产生一个环境");
+        assertEquals(1, backend.provisionCalls(), "后端开通只能发生一次");
+        assertEquals(1, service.quotaUsed("tenant-a"), "只能占一份配额");
+        log.info("concurrent same-request-id retries: threads={} distinctEnvIds={} provisionCalls={}",
+                threads, envIds.size(), backend.provisionCalls());
+    }
+
+    @Test
     void concurrentCreatesNeverOversellQuota() throws Exception {
         int threads = 32; // 配额 8，远小于并发数
         AtomicInteger rejected = new AtomicInteger();
