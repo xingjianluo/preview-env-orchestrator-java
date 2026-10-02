@@ -30,9 +30,11 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * 并发模型：
  * - 每条环境记录按 envId 分段加锁，迁移在锁内完成，杜绝并发覆盖；
- * - 带请求标识的创建按 (tenant, idempotencyKey) 在 ConcurrentHashMap.compute 内原子完成，
+ * - 带幂等键的创建按 (tenant, idempotencyKey) 在键锁内串行完成，
  *   同一 key 的重试/并发提交只会产生一条记录、开通一次、计一份配额；
- * - 不带请求标识的创建每次都登记新记录，同租户的两次创建彼此独立，互不顶替；
+ * - 不带幂等键但带 X-Request-Id 的创建按 (tenant, requestId) 去重，
+ *   同一请求标识的失败重试复用首次登记的环境，不重复登记、不重复占配额；
+ * - 两个标识都不带的创建每次都登记新记录，同租户的两次创建彼此独立，互不顶替；
  * - 变更请求按 (tenant, requestId) 在 {@link ReceiptStore} 认领执行权：
  *   同标识并发/重试排队复用同一结论，成功结论冻结，后续操作不得改写；
  * - 配额使用 per-tenant AtomicInteger CAS 预留，销毁时归还，不超卖。
@@ -66,6 +68,13 @@ public class EnvironmentService {
      * 不同 key 使用不同锁对象，互不阻塞；无标识创建不经过这里。
      */
     private final Map<String, ReentrantLock> keyLocks = new ConcurrentHashMap<>();
+    /**
+     * 无幂等键但带 X-Request-Id 的创建：(tenant, requestId) -> envId。
+     * 首次尝试登记环境后若开通失败，调用方用同一请求标识重试时必须复用同一环境，
+     * 不得再登记新记录、再占一份配额；不带请求标识的创建不进此表，彼此独立。
+     * 该表只在拿到回执执行权（同一 requestId 至多一个在途）后读写，无需额外锁。
+     */
+    private final Map<String, String> envIdByRequestId = new ConcurrentHashMap<>();
 
     public EnvironmentService(RuntimeBackend backend, Clock clock, OrchestratorProperties props) {
         this.backend = backend;
@@ -111,12 +120,26 @@ public class EnvironmentService {
             EnvRecord registered;
             boolean isNewRegistration;
             if (idempotencyKey == null) {
-                // 无请求标识：每次都是独立创建，绝不进入 envIdByKey，杜绝同租户互相顶替
-                String envId = reserveAndRegister(tenantId, null, requestId);
-                registered = byIdOrThrow(envId);
-                isNewRegistration = true;
+                // 无幂等键：带 X-Request-Id 时按请求标识去重——同一标识的重试复用首次登记的
+                // 环境（开通失败重试不得再登记新记录、再占一份配额）；不带标识的每次创建
+                // 都登记独立新环境，绝不按租户合并。
+                String requestKey = clientRequestId != null ? tenantId + ":" + clientRequestId : null;
+                String reusedEnvId = requestKey != null ? envIdByRequestId.get(requestKey) : null;
+                if (reusedEnvId != null) {
+                    registered = byIdOrThrow(reusedEnvId);
+                    isNewRegistration = false;
+                    log.info("[{}] create retry-hit env={} tenant={} state={} (same X-Request-Id, no new env)",
+                            requestId, registered.envId(), tenantId, registered.state());
+                } else {
+                    String envId = reserveAndRegister(tenantId, null, requestId);
+                    if (requestKey != null) {
+                        envIdByRequestId.put(requestKey, envId);
+                    }
+                    registered = byIdOrThrow(envId);
+                    isNewRegistration = true;
+                }
                 EnvRecord result = ensureProvisioned(registered, requestId);
-                boolean changed = result.state() != EnvState.CREATING;
+                boolean changed = isNewRegistration && result.state() != EnvState.CREATING;
                 receipt = receipts.succeed(receipt, result.envId(), result.state(), changed);
                 log.info("[{}] create settled env={} tenant={} state={} changed={}",
                         requestId, result.envId(), tenantId, result.state(), changed);
@@ -375,7 +398,21 @@ public class EnvironmentService {
                     Transitions.explain(from, EnvState.DESTROYING));
         }
         try {
-            backend.destroy(envId); // 后端幂等，同时清理开通失败可能留下的残留
+            if (from == EnvState.CREATING) {
+                // 开通可能在途：必须先拿到该环境的开通锁（等在途 provision 结束）再清理，
+                // 否则会出现“控制面已 DESTROYED、后端却后知后觉落下真实实例”的分叉。
+                // 锁序安全：ensureProvisioned 先放开通锁再取迁移锁，此处持迁移锁等开通锁，
+                // 两把锁不会互相持有等待，不会死锁。
+                ReentrantLock provisionLock = provisionLockFor(envId);
+                provisionLock.lock();
+                try {
+                    backend.destroy(envId); // 后端幂等，同时清理开通失败/在途可能留下的残留
+                } finally {
+                    provisionLock.unlock();
+                }
+            } else {
+                backend.destroy(envId); // 后端幂等，可安全重试
+            }
         } catch (RuntimeException e) {
             put(current.withState(EnvState.DESTROYING, cause, now()));
             log.warn("[{}] destroy failed env={} {} -> DESTROYING kept, retryable: {}",
@@ -386,7 +423,11 @@ public class EnvironmentService {
         EnvRecord destroying = from == EnvState.DESTROYING ? current
                 : put(current.withState(EnvState.DESTROYING, cause, now()));
         EnvRecord destroyed = transitionLocked(destroying, EnvState.DESTROYED, cause, requestId,
-                cause == StopCause.LEASE_EXPIRED ? "lease expired, auto destroy" : "manual destroy");
+                switch (cause) {
+                    case LEASE_EXPIRED -> "lease expired, auto destroy";
+                    case PROVISION_TIMEOUT -> "provisioning timed out, auto cleanup";
+                    default -> "manual destroy";
+                });
         releaseQuota(destroyed.tenantId(), requestId);
         return destroyed;
     }
@@ -473,7 +514,9 @@ public class EnvironmentService {
 
     /**
      * 由 LeaseReaper 调用：回收空闲超时环境。
-     * RUNNING 空闲超 idleStopTtl 自动停止；STOPPED 空闲超 idleDestroyTtl 自动销毁。
+     * RUNNING 空闲超 idleStopTtl 自动停止；STOPPED 空闲超 idleDestroyTtl 自动销毁；
+     * CREATING 滞留超 provisioningTtl（开通失败未重试/未清理）自动清理并归还配额；
+     * DESTROYING 残留每轮重试直至终态。
      * 返回本轮回收（状态发生变化）的环境数。
      */
     public int reapIdle() {
@@ -488,6 +531,12 @@ public class EnvironmentService {
                 } else if (r.state() == EnvState.STOPPED
                         && r.lastActiveAt().plus(props.getIdleDestroyTtl()).isBefore(now)) {
                     destroyInternal(null, r.envId(), StopCause.LEASE_EXPIRED, newRequestId());
+                    reclaimed++;
+                } else if (r.state() == EnvState.CREATING
+                        && r.createdAt().plus(props.getProvisioningTtl()).isBefore(now)) {
+                    // 开通失败/超时后长期滞留：自动清理（含后端可能的残留），配额归还，
+                    // 杜绝卡住的环境永远占着配额收不回来
+                    destroyInternal(null, r.envId(), StopCause.PROVISION_TIMEOUT, newRequestId());
                     reclaimed++;
                 } else if (r.state() == EnvState.DESTROYING) {
                     // 上次销毁中途失败的残留：每轮重试直至抵达终态，不遗漏

@@ -19,8 +19,9 @@ import java.util.List;
  *
  * <p>变更类接口（创建/启动/停止/销毁）支持可选请求头 {@code X-Request-Id}：
  * 调用方用自己的请求标识提交，可用同一标识回查回执；不传时服务端生成并随响应返回。
- * 创建的 body.idempotencyKey 仍承担“同标识重试合并到同一环境”的幂等语义；
- * 不传 idempotencyKey 的两次创建彼此独立。
+ * 创建的去重/合并看两个标识：body.idempotencyKey 非空时按 (租户, key) 合并；
+ * 不带 idempotencyKey 时按 (租户, X-Request-Id) 合并——同一请求标识的重试复用同一环境；
+ * 两个标识都不带的两次创建彼此独立。
  */
 @RestController
 @RequestMapping("/api/envs")

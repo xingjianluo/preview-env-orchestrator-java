@@ -6,5 +6,7 @@ package com.github.xingjianluo.previewenvorchestratorjava.domain;
 public enum StopCause {
     NONE,
     MANUAL,
-    LEASE_EXPIRED
+    LEASE_EXPIRED,
+    /** 开通超时/失败后长期滞留 CREATING，被回收器清理。 */
+    PROVISION_TIMEOUT
 }
