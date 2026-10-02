@@ -111,10 +111,21 @@ public class EnvironmentService {
             EnvRecord registered;
             boolean isNewRegistration;
             if (idempotencyKey == null) {
-                // 无请求标识：每次都是独立创建，绝不进入 envIdByKey，杜绝同租户互相顶替
-                String envId = reserveAndRegister(tenantId, null, requestId);
-                registered = byIdOrThrow(envId);
-                isNewRegistration = true;
+                // 无幂等键：首次调用登记独立新环境，绝不进入 envIdByKey，杜绝同租户互相顶替；
+                // 但同一请求标识的重试（上次开通中途失败）必须复用已登记的环境——
+                // 回执在登记时已绑定 envId，此处找回，不新建、不重复占配额。
+                EnvRecord bound = receipt.envId() == null ? null : byId.get(receipt.envId());
+                if (bound != null && bound.state() != EnvState.DESTROYED) {
+                    registered = bound;
+                    isNewRegistration = false;
+                    log.info("[{}] create retry reuses env={} tenant={} state={} (bound to same request id)",
+                            requestId, bound.envId(), tenantId, bound.state());
+                } else {
+                    String envId = reserveAndRegister(tenantId, null, requestId);
+                    receipt = receipts.bindEnv(receipt, envId);
+                    registered = byIdOrThrow(envId);
+                    isNewRegistration = true;
+                }
                 EnvRecord result = ensureProvisioned(registered, requestId);
                 boolean changed = result.state() != EnvState.CREATING;
                 receipt = receipts.succeed(receipt, result.envId(), result.state(), changed);
@@ -133,6 +144,7 @@ public class EnvironmentService {
                 if (existingEnvId == null) {
                     String envId = reserveAndRegister(tenantId, idempotencyKey, requestId);
                     envIdByKey.put(mapKey, envId);
+                    receipt = receipts.bindEnv(receipt, envId);
                     registered = byIdOrThrow(envId);
                     isNewRegistration = true;
                 } else {
@@ -280,8 +292,37 @@ public class EnvironmentService {
     }
 
     public OperationResult destroy(String tenantId, String envId, String clientRequestId) {
-        return mutate(tenantId, envId, clientRequestId, OperationKind.DESTROY,
-                (requestId, current) -> destroyInternal(tenantId, envId, StopCause.MANUAL, requestId, current));
+        String requestId = clientRequestId != null ? clientRequestId : newRequestId();
+        ReceiptStore.Claim claim = receipts.claim(tenantId, requestId, OperationKind.DESTROY);
+        RequestReceipt receipt = claim.receipt();
+        if (claim.outcome() == ReceiptStore.ClaimOutcome.REPLAY) {
+            return replay(tenantId, requestId, receipt);
+        }
+        // 锁顺序固定为 provisionLock -> envLock（与 ensureProvisioned 一致）：
+        // 销毁先等可能在途的开通落定，再清理实例，杜绝“控制面已 DESTROYED、
+        // 后台开通才完成并留下真实实例”的分叉。
+        ReentrantLock provisionLock = provisionLockFor(envId);
+        provisionLock.lock();
+        try {
+            ReentrantLock lock = lockFor(envId);
+            lock.lock();
+            long beforeVersion;
+            EnvRecord next;
+            try {
+                EnvRecord current = requireOwned(tenantId, envId, requestId);
+                beforeVersion = current.version();
+                next = destroyInternal(tenantId, envId, StopCause.MANUAL, requestId, current);
+            } catch (OrchestratorException e) {
+                throw failAndRethrow(receipt, e);
+            } finally {
+                lock.unlock();
+            }
+            boolean changed = next.version() != beforeVersion;
+            receipt = receipts.succeed(receipt, next.envId(), next.state(), changed);
+            return new OperationResult(next, receipt);
+        } finally {
+            provisionLock.unlock();
+        }
     }
 
     /** 环境单条锁内执行的变更动作，返回迁移后的最新记录。 */
@@ -391,17 +432,23 @@ public class EnvironmentService {
         return destroyed;
     }
 
-    /** 租约回收路径专用销毁（无租户校验、无回执）。 */
+    /** 租约回收路径专用销毁（无租户校验、无回执）。锁顺序与手动销毁一致：provisionLock -> envLock。 */
     private EnvRecord destroyInternal(String tenantId, String envId, StopCause cause, String requestId) {
-        ReentrantLock lock = lockFor(envId);
-        lock.lock();
+        ReentrantLock provisionLock = provisionLockFor(envId);
+        provisionLock.lock();
         try {
-            EnvRecord current = tenantId == null
-                    ? byIdOrThrow(envId)
-                    : requireOwned(tenantId, envId, requestId);
-            return destroyInternal(tenantId, envId, cause, requestId, current);
+            ReentrantLock lock = lockFor(envId);
+            lock.lock();
+            try {
+                EnvRecord current = tenantId == null
+                        ? byIdOrThrow(envId)
+                        : requireOwned(tenantId, envId, requestId);
+                return destroyInternal(tenantId, envId, cause, requestId, current);
+            } finally {
+                lock.unlock();
+            }
         } finally {
-            lock.unlock();
+            provisionLock.unlock();
         }
     }
 
@@ -492,6 +539,12 @@ public class EnvironmentService {
                 } else if (r.state() == EnvState.DESTROYING) {
                     // 上次销毁中途失败的残留：每轮重试直至抵达终态，不遗漏
                     destroyInternal(null, r.envId(), r.stopCause(), newRequestId());
+                    reclaimed++;
+                } else if (r.state() == EnvState.CREATING
+                        && r.lastActiveAt().plus(props.getCreatingTtl()).isBefore(now)) {
+                    // 开通卡死（开通失败且调用方未再重试）：清理可能的后端残留并归还配额，
+                    // 不让卡住的环境一直占着配额收不回来
+                    destroyInternal(null, r.envId(), StopCause.LEASE_EXPIRED, newRequestId());
                     reclaimed++;
                 }
             } catch (OrchestratorException e) {

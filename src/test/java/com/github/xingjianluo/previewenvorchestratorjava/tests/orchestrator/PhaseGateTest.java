@@ -166,8 +166,40 @@ class PhaseGateTest {
     }
 
     @Test
-    void ordinaryIllegalTransitionsRemainIllegalStateReason() {
-        EnvRecord env = service.create(TENANT, "phase-4", null).env();
+    void destroyWhileProvisionInFlightConvergesWithoutResidualInstance() throws Exception {
+        // 开通卡在半路时发起销毁：销毁会等在途开通落定后再清理，
+        // 最终控制面显示 DESTROYED 时后端绝不允许还留着真实实例
+        backend.entered = new CountDownLatch(1);
+        backend.release = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<OperationResult> creating = pool.submit(() -> service.create(TENANT, "phase-5", "req-c5"));
+            EnvRecord rec = creatingEnv("phase-5", "req-c5", creating);
+
+            Future<OperationResult> destroying = pool.submit(
+                    () -> service.destroy(TENANT, rec.envId(), "req-d5"));
+            Thread.sleep(100); // 给销毁线程时间进入等待在途开通的临界区
+            assertFalse(destroying.isDone(), "开通未落定前销毁不得抢跑完成（否则可能留下残留实例）");
+
+            backend.release.countDown(); // 开通继续并完成
+            OperationResult destroyed = destroying.get(5, TimeUnit.SECONDS);
+            creating.get(5, TimeUnit.SECONDS);
+
+            assertEquals(EnvState.DESTROYED, destroyed.env().state());
+            assertEquals(EnvState.DESTROYED, service.get(TENANT, rec.envId()).state(),
+                    "控制面终态必须是 DESTROYED");
+            assertFalse(backend.exists(rec.envId()),
+                    "控制面显示已销毁，后端就不得残留真实实例");
+            assertEquals(0, service.quotaUsed(TENANT), "配额必须归还，与实际环境数量对齐");
+            log.info("destroy during provisioning converged: env={} state={} backendExists={}",
+                    rec.envId(), destroyed.env().state(), backend.exists(rec.envId()));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void ordinaryIllegalTransitionsRemainIllegalStateReason() {        EnvRecord env = service.create(TENANT, "phase-4", null).env();
         // STOPPED -> STOPPED：阶段说得通但目标重复，仍是普通非法迁移
         OrchestratorException e = assertThrows(OrchestratorException.class,
                 () -> service.stop(TENANT, env.envId(), "req-dup-stop"));

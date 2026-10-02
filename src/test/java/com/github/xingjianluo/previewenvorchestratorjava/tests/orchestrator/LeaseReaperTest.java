@@ -112,8 +112,37 @@ class LeaseReaperTest {
     }
 
     @Test
-    void failedReclaimIsRetriedOnNextSweepWithoutLoss() {
-        EnvRecord env = service.create(TENANT, "lease-4");
+    void stuckCreatingEnvIsReapedAndQuotaReleased() {
+        // 开通中途失败、调用方不再重试：卡住的环境不得一直占着配额收不回来
+        backend.failNext("provision");
+        try {
+            service.create(TENANT, "lease-stuck");
+        } catch (RuntimeException expected) {
+            // 开通失败，记录停留 CREATING
+        }
+        EnvRecord stuck = service.list(TENANT).get(0);
+        assertEquals(EnvState.CREATING, stuck.state());
+        assertEquals(1, service.quotaUsed(TENANT));
+
+        // 未到 creatingTtl（默认 30 分钟）不得误回收
+        clock.advance(Duration.ofMinutes(29));
+        assertEquals(0, reaper.sweepOnce(), "开通未卡满 creatingTtl 不得回收");
+        assertEquals(EnvState.CREATING, service.get(TENANT, stuck.envId()).state());
+
+        // 卡满 creatingTtl：回收器清理残留、记录收敛 DESTROYED、配额归还
+        clock.advance(Duration.ofMinutes(2));
+        assertEquals(1, reaper.sweepOnce(), "卡死的 CREATING 必须被回收");
+        EnvRecord reaped = service.get(TENANT, stuck.envId());
+        assertEquals(EnvState.DESTROYED, reaped.state());
+        assertEquals(StopCause.LEASE_EXPIRED, reaped.stopCause());
+        assertEquals(0, service.quotaUsed(TENANT), "配额必须归还，与实际环境对齐");
+        assertFalse(backend.exists(stuck.envId()), "不得残留真实实例");
+        log.info("stuck CREATING reaped: env={} state={} quotaUsed={}",
+                stuck.envId(), reaped.state(), service.quotaUsed(TENANT));
+    }
+
+    @Test
+    void failedReclaimIsRetriedOnNextSweepWithoutLoss() {        EnvRecord env = service.create(TENANT, "lease-4");
         clock.advance(Duration.ofMinutes(31));
 
         backend.failNext("destroy");

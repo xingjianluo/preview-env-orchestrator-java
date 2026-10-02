@@ -51,6 +51,15 @@ public record RequestReceipt(
                 envId, snapshotState, false, reason, message, createdAt, now);
     }
 
+    /**
+     * 把已登记的环境绑定到在途回执上：开通中途失败时 FAILED 回执仍记得 envId，
+     * 同一请求标识的重试据此复用同一个环境，而不是再登记一个新环境。
+     */
+    public RequestReceipt withEnv(String envId) {
+        return new RequestReceipt(tenantId, requestId, kind, status, retryable,
+                envId, snapshotState, stateChanged, failureReason, failureMessage, createdAt, finishedAt);
+    }
+
     /** 是否仍在处理中。 */
     public boolean isProcessing() {
         return status == ReceiptStatus.PROCESSING;

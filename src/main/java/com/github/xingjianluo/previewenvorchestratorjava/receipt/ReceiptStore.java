@@ -78,8 +78,10 @@ public class ReceiptStore {
                         holder[0] = new Claim(ClaimOutcome.REPLAY, existing);
                         return existing;
                     }
-                    // 可重试失败：原子重开，仅一个提交者拿到执行权
-                    RequestReceipt reopened = RequestReceipt.processing(tenantId, requestId, kind, now);
+                    // 可重试失败：原子重开，仅一个提交者拿到执行权；
+                    // 沿用上次已登记的 envId，重试复用同一环境（不新建、不重复占配额）
+                    RequestReceipt reopened = RequestReceipt.processing(tenantId, requestId, kind, now)
+                            .withEnv(existing.envId());
                     holder[0] = new Claim(ClaimOutcome.EXECUTE, reopened);
                     return reopened;
                 }
@@ -94,6 +96,19 @@ public class ReceiptStore {
                                   EnvState snapshotState, boolean changed) {
         String k = key(processing.tenantId(), processing.requestId());
         RequestReceipt updated = processing.succeeded(envId, snapshotState, changed, Instant.now(clock));
+        byKey.compute(k, (key, current) ->
+                current != null && current.status() == ReceiptStatus.PROCESSING ? updated : current);
+        return byKey.get(k);
+    }
+
+    /**
+     * 把已登记的环境绑定到在途（PROCESSING）回执上。
+     * 创建请求登记环境后立即调用：此后即使开通失败，FAILED 回执仍携带 envId，
+     * 同一请求标识的重试可据此找回同一个环境。
+     */
+    public RequestReceipt bindEnv(RequestReceipt processing, String envId) {
+        String k = key(processing.tenantId(), processing.requestId());
+        RequestReceipt updated = processing.withEnv(envId);
         byKey.compute(k, (key, current) ->
                 current != null && current.status() == ReceiptStatus.PROCESSING ? updated : current);
         return byKey.get(k);

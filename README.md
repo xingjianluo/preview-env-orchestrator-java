@@ -12,6 +12,15 @@
 3. **请求回执**：创建/启动/停止/销毁支持请求标识回查，结论分成功/处理中/失败可重试，
    且历史结论冻结，不被后续操作改写。老的不带标识调用方式照旧可用。
 
+本轮在接口与调用方式不变的前提下进一步加固重试与清理：
+
+- 不带幂等键、只带 `X-Request-Id` 的创建，同一请求标识的重试（含开通失败后的重试）
+  复用首次登记的环境：只开通一次、只占一份配额，不会被拆成两个；
+- 开通还在进行中就发起销毁时，销毁等在途开通落定后再清理，
+  控制面显示 DESTROYED 与后端真实实例始终一致；
+- 开通卡死（失败且未再重试）的 CREATING 环境由租约回收器按 `creating-ttl` 自动清理，
+  配额不会收不回来。
+
 ## 生命周期状态机
 
 ```
@@ -29,7 +38,7 @@
 
 | 当前状态 | start | stop | destroy | keep-alive |
 |---|---|---|---|---|
-| CREATING（开通未完成） | ❌ `ENV_STILL_PROVISIONING`（可重试） | ❌ `ENV_STILL_PROVISIONING`（可重试） | ✅ 清理到 DESTROYED（含开通残留） | ❌ |
+| CREATING（开通未完成） | ❌ `ENV_STILL_PROVISIONING`（可重试） | ❌ `ENV_STILL_PROVISIONING`（可重试） | ✅ 清理到 DESTROYED（含开通残留；会等在途开通落定后再清） | ❌ `ILLEGAL_STATE_TRANSITION` |
 | STOPPED | ✅ → RUNNING | ❌ `ILLEGAL_STATE_TRANSITION`（重复停止，不可盲目重试） | ✅ | ✅ |
 | RUNNING | ❌ `ILLEGAL_STATE_TRANSITION`（重复启动） | ✅ → STOPPED | ✅ | ✅ |
 | DESTROYING（销毁中途失败残留） | ❌ `ILLEGAL_STATE_TRANSITION` | ❌ `ILLEGAL_STATE_TRANSITION` | ✅ 重试清理 | ❌ |
@@ -47,12 +56,21 @@
 立即看到 CREATING 并被拒绝，而不是被阻塞到开通结束后误当成一次成功启停。开通完成前控制面
 绝不会显示 STOPPED/RUNNING，后端也不存在实例，二者始终对得上。
 
+销毁与在途开通的并发按固定锁顺序（开通锁 → 迁移锁）串行：**开通还在进行中就发起销毁时，
+销毁会等这次开通落定，再把实例一并清理**——不会出现“列表显示销毁成功、后台却残留真实实例”；
+反过来销毁先完成时，开通线程在提交前 double-check 到记录已非 CREATING，直接放弃开通结果，
+控制面状态与真实实例始终一致。
+
 ### 开通失败的收敛
 
-- 开通中途失败：记录停留 CREATING、占一份配额，回执为 `FAILED` + `retryable=true`，后端无残留实例。
-- **继续重试**：用同一幂等键（以及同一 X-Request-Id）再提交，开通成功后收敛到 STOPPED，只占一份配额。
+- 开通中途失败：记录停留 CREATING、占一份配额，回执为 `FAILED` + `retryable=true`，后端无残留实例；
+  失败回执已绑定该环境，同一 X-Request-Id 的重试会找回它而不是另起炉灶。
+- **继续重试**：用同一 X-Request-Id（带幂等键时同 `(租户, key)`）再提交，开通成功后收敛到
+  STOPPED，仍只占一份配额、不多出环境。
 - **直接清理**：对 CREATING 调 destroy，后端幂等清理可能的残留，收敛到 DESTROYED、配额归还，
   控制面与真实载体都不再有该环境。
+- **既不重试也不清理**：CREATING 停留超过 `orchestrator.creating-ttl`（默认 30m）后由
+  `LeaseReaper` 自动清理，残留实例一并销毁、配额归还，不会一直占着配额收不回来。
 
 ## 请求标识与幂等创建
 
@@ -63,11 +81,15 @@
 | 幂等键 `idempotencyKey` | 创建请求 body 字段 | 决定“是不是同一个环境”：同 `(租户, key)` 的重试合并到同一环境 |
 | 请求标识 `X-Request-Id` | 变更接口的请求头 | 决定“是不是同一次请求”：用于认领执行权与回查回执结论 |
 
-创建规则：
+创建规则（三种标识组合各自的合并行为）：
 
 - **带 idempotencyKey**：同一 `(tenantId, key)` 的重试/并发提交返回同一环境，
   后端 `provision` 只执行一次、配额只计一次。带同一幂等键的重试不会被拆成两个实例。
-- **不带 idempotencyKey（为 null）**：每次调用都登记并开通一个**彼此独立**的新环境，
+- **不带 idempotencyKey、只带 X-Request-Id**（CI 常见用法）：首次提交登记一个独立环境并
+  把 envId 绑定到该请求的回执上；**用同一 X-Request-Id 重试**（含上次开通中途失败后的重试）
+  一律复用首次登记的环境继续开通——不会新建第二个环境、不会重复占配额、
+  卡住的环境不会无人认领。**换一个新的 X-Request-Id** 则视为另一次独立创建，各自登记新环境。
+- **两个标识都不带**：每次调用都登记并开通一个**彼此独立**的新环境，
   各自占配额、各自有生命周期；销毁其中一个不会影响其它环境，也不会因为同租户被合并。
 - 销毁仍幂等：后端清理失败停留 DESTROYING 可安全重试；已 DESTROYED 再销毁直接返回当前记录；
   抵达终态时配额精确归还一次。
@@ -115,6 +137,8 @@
 - `LeaseReaper` 定期扫描（`orchestrator.reaper-interval-ms`，默认 60s）：
   - `RUNNING` 空闲超过 `orchestrator.idle-stop-ttl`（默认 30m）→ 自动停止；
   - `STOPPED` 空闲超过 `orchestrator.idle-destroy-ttl`（默认 2h）→ 自动销毁，容量重新纳入配额；
+  - `CREATING` 停留超过 `orchestrator.creating-ttl`（默认 30m）→ 视为开通卡死，自动清理
+    （含后端残留）并归还配额；
   - 停留 `DESTROYING` 的残留每轮重试直至终态，不遗漏、不重复计数。
 - 回收结果通过 `stopCause` 与手动操作区分：`MANUAL` vs `LEASE_EXPIRED`。
 - 时间全部来自可注入的 `Clock`，测试用 `MutableClock` 确定性推进，不依赖真实等待。
@@ -141,20 +165,32 @@ ENV_STILL_PROVISIONING / REQUEST_IN_PROGRESS / REQUEST_KIND_CONFLICT / RECEIPT_N
 ## 本地验证
 
 ```bash
-# 全部测试（34 个用例）：创建区分、同标识合并不多占配额、开通阶段启停拒绝原因可区分、
-# 请求回执重试前后稳定，以及原有的并发创建、配额争用、租约回收不回归
+# 全部测试（41 个用例）：同标识重试合并（含无幂等键只带 X-Request-Id 的 CI 用法）、
+# 开通失败重试不重复建环境、开通中销毁控制面与真实实例一致、回执重试前后稳定，
+# 以及原有的并发创建、配额争用、租约回收不回归
 mvn test
+
+# 测试日志按业务分组输出：每个用例一行结果，每个测试类一行汇总，例如：
+#   [业务覆盖] CreateRetryConsistencyTest :: keylessRetryWithSameRequestIdMergesIntoOneEnvAndOneQuota -> 通过
+#   [业务汇总] CreateRetryConsistencyTest 用例=5 通过=5 失败=0 跳过=0
+mvn test | grep '业务'
 
 # 启动本地服务
 mvn spring-boot:run
 
-# 1) 两次都不带 idempotencyKey：得到两个彼此独立的环境
+# 1) 两次都不带标识：得到两个彼此独立的环境
 curl -s -X POST localhost:8080/api/envs -H 'X-Tenant-Id: t1' \
      -H 'Content-Type: application/json' -d '{}'
 curl -s -X POST localhost:8080/api/envs -H 'X-Tenant-Id: t1' \
      -H 'Content-Type: application/json' -d '{}'
 
-# 2) 带同一 idempotencyKey + 同一 X-Request-Id 重试：合并到同一环境
+# 2) 不带 idempotencyKey、只带同一 X-Request-Id 重试（CI 用法）：合并到同一环境
+curl -s -X POST localhost:8080/api/envs -H 'X-Tenant-Id: t1' \
+     -H 'X-Request-Id: ci-req-1' -H 'Content-Type: application/json' -d '{}'
+curl -s -X POST localhost:8080/api/envs -H 'X-Tenant-Id: t1' \
+     -H 'X-Request-Id: ci-req-1' -H 'Content-Type: application/json' -d '{}'
+
+# 3) 带同一 idempotencyKey + 同一 X-Request-Id 重试：同样合并到同一环境
 curl -s -X POST localhost:8080/api/envs -H 'X-Tenant-Id: t1' \
      -H 'X-Request-Id: demo-req-1' -H 'Content-Type: application/json' \
      -d '{"idempotencyKey":"demo-1"}'
@@ -162,18 +198,22 @@ curl -s -X POST localhost:8080/api/envs -H 'X-Tenant-Id: t1' \
      -H 'X-Request-Id: demo-req-1' -H 'Content-Type: application/json' \
      -d '{"idempotencyKey":"demo-1"}'
 
-# 3) 回查该请求的回执（结论稳定）
-curl -s localhost:8080/api/envs/requests/demo-req-1 -H 'X-Tenant-Id: t1'
+# 4) 回查该请求的回执（结论稳定）
+curl -s localhost:8080/api/envs/requests/ci-req-1 -H 'X-Tenant-Id: t1'
 ```
 
 关键单测与行为对应：
 
-- `CreateDedupTest`：无标识多次创建各自独立、销毁不连带；同标识重试合并且不多占配额；
-  失败后同标识重试只占一份配额。
+- `CreateRetryConsistencyTest`：无幂等键只带 X-Request-Id 的重试合并到同一环境、只占一份配额；
+  开通中途失败后同标识重试复用卡住的环境、不产生第二个；不同请求标识各自独立；
+  回执在重试前后结论稳定；失败后直接清理配额与残留收敛。
+- `CreateDedupTest`：无标识多次创建各自独立、销毁不连带；同幂等键重试合并且不多占配额。
 - `PhaseGateTest`：开通未完成阶段 start/stop 返回 `ENV_STILL_PROVISIONING` 且原因含操作名；
-  拒绝后不出现幻影状态；开通失败后重试或直接清理都收敛自洽；普通重复迁移仍是
-  `ILLEGAL_STATE_TRANSITION` 且不可盲目重试。
+  **开通进行中发起销毁会等在途开通落定再清理，控制面 DESTROYED 时后端绝无残留实例**；
+  开通失败后重试或直接清理都收敛自洽；普通重复迁移仍是 `ILLEGAL_STATE_TRANSITION`。
+- `LeaseReaperTest`：空闲停止/销毁、卡死 CREATING 超 `creating-ttl` 自动清理并归还配额、
+  销毁中途失败下一轮重试不遗漏。
 - `ReceiptTest` / `ReceiptConcurrencyTest` / `ReceiptApiTest`：成功结论冻结、后续操作不改写；
   可重试失败收敛；同标识并发只执行一次、其余处理中；回执端点与 404/409 映射；无标识老用法仍可用。
-- `ConcurrencyTest` / `EnvironmentServiceTest` / `LeaseReaperTest` / `EnvApiTest`：
-  原有并发创建、配额争用、租约回收、HTTP 错误映射不回归。
+- `ConcurrencyTest` / `EnvironmentServiceTest` / `EnvApiTest`：
+  原有并发创建、配额争用、HTTP 错误映射不回归。
